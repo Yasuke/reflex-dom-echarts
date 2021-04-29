@@ -13,6 +13,7 @@ module Reflex.Dom.Widget.ECharts
   , TimeLineChartConfig(..)
   , lineChart
   , timeLineChart
+  , ChartSize(..)
   , module X
   )
   where
@@ -35,13 +36,23 @@ import Data.Text (Text)
 import Control.Lens
 import Reflex.Network
 
+import GHCJS.DOM (currentWindowUnchecked)
+import qualified GHCJS.DOM.Types as Types
+import qualified GHCJS.DOM.EventM as EventM
+import qualified GHCJS.DOM.GlobalEventHandlers as GEvent
+import qualified GHCJS.DOM.HTMLElement as Element
+
 type XAxisData = Text
+
+data ChartSize
+  = Pixels Int Int
+  | ContainerSize
 
 data LineChartConfig t k = LineChartConfig
   -- XXX Can be made a Dynamic
   -- and use this API to adjust size
   -- https://ecomfe.github.io/echarts-doc/public/en/api.html#echartsInstance.resize
-  { _lineChartConfig_size :: (Int, Int)
+  { _lineChartConfig_size :: ChartSize
   -- We will re-create the whole chart if the options change
   , _lineChartConfig_options :: Dynamic t ChartOptions
   , _lineChartConfig_series :: Map k
@@ -55,6 +66,11 @@ data Chart t = Chart
   { _chart_rendered :: Event t ()
   , _chart_finished :: Event t ()
   }
+
+-- | Width and height in pixels (including borders)
+elementComputedSize :: Types.IsHTMLElement e => e -> JSM (Int, Int)
+elementComputedSize e =
+  (,) <$> (round <$> Element.getOffsetWidth e) <*> (round <$> Element.getOffsetHeight e)
 
 lineChart
   :: forall t m k .
@@ -72,19 +88,27 @@ lineChart
 lineChart c = do
   let
     cDyn = _lineChartConfig_options c
-    attr = (_lineChartConfig_size c) & \(w, h) ->
-      "style" =: ("width:" <> tshow w <> "px; height:" <> tshow h <> "px;")
+    attr = (_lineChartConfig_size c) & \case
+      Pixels w h ->
+        "style" =: ("width:" <> tshow w <> "px; height:" <> tshow h <> "px;")
+      ContainerSize ->
+        "style" =: "display: inline-block; width: 100%; height: 100%;"
   e <- fst <$> elAttr' "div" attr blank
+  let rawElement = _element_raw e
+  rawHtmlElement <- Types.unsafeCastTo Types.HTMLElement rawElement
+
 
   -- The initialization is done using PostBuild because the element need
   -- to be present in the DOM before calling echarts APIs
-  p <- getPostBuild
+  p <- getPostBuild >>= delay 0.1
   (evR, onActionR) <- newTriggerEvent
   (evF, onActionF) <- newTriggerEvent
 
   -- Init the chart
   chartEv <- performEvent $ ffor p $ \_ -> liftJSM $ do
-    chart <- X.initECharts $ _element_raw e
+    initialDims <- liftJSM $ elementComputedSize rawHtmlElement
+    liftIO $ print initialDims
+    chart <- X.initECharts rawElement (EChartOpts initialDims)
     X.onRenderedAction chart (liftIO $ onActionR ())
     X.onFinishedAction chart (liftIO $ onActionF ())
     return chart
@@ -119,6 +143,16 @@ lineChart c = do
       let
         updEv = mergeList $ map snd vs
         seriesJSVals = map fst vs
+
+      window <- currentWindowUnchecked
+      _ <- liftJSM $ EventM.on window GEvent.resize $ liftJSM $ do
+        (w, h) <- elementComputedSize rawHtmlElement
+        dimObj <- obj
+        _ <- (dimObj <# ("width" :: JSString)) w
+        _ <- (dimObj <# ("height" :: JSString)) h
+        _ <- (X.unECharts chart) ^. js1 ("resize" :: JSString) dimObj
+        return ()
+
 
       performEvent_ $ ffor updEv $ \xs -> liftJSM $ do
         series <- toJSVal seriesJSVals
@@ -176,7 +210,7 @@ timeLineChart c = do
 
   -- Init the chart
   chartEv <- performEvent $ ffor p $ \_ -> liftJSM $ do
-    chart <- X.initECharts $ _element_raw e
+    chart <- X.initECharts (_element_raw e) (EChartOpts $ _timeLineChartConfig_size c)
     -- This causes a flickr in charts
     -- dont know what is the fix
     -- X.onRenderedAction chart (liftIO $ onActionR ())
